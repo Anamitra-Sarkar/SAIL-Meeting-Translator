@@ -8,12 +8,20 @@ TARGET_SAMPLE_RATE = 16000
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int = TARGET_SAMPLE_RATE) -> np.ndarray:
     """
     Resample 1D float32 audio array to the target sample rate.
+    Safely handles edge cases like zero/negative sample rates or empty arrays.
     """
-    if orig_sr == target_sr or len(audio) == 0:
+    if orig_sr <= 0 or target_sr <= 0 or len(audio) == 0:
+        return np.empty(0, dtype=np.float32)
+
+    if orig_sr == target_sr:
         return audio.astype(np.float32)
 
+    # Convert multi-channel audio to mono if necessary
+    if audio.ndim > 1:
+        audio = audio.mean(axis=-1)
+
     # Calculate target number of samples
-    target_length = int(round(len(audio) * float(target_sr) / orig_sr))
+    target_length = int(round(len(audio) * float(target_sr) / float(orig_sr)))
     if target_length <= 0:
         return np.empty(0, dtype=np.float32)
 
@@ -35,6 +43,16 @@ def pcm_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
     if not pcm_bytes or len(pcm_bytes) % 4 != 0:
         return np.empty(0, dtype=np.float32)
     return np.frombuffer(pcm_bytes, dtype=np.float32).copy()
+
+def ensure_mono_float32(audio: np.ndarray) -> np.ndarray:
+    """
+    Ensures input audio is 1D float32 mono.
+    """
+    if not isinstance(audio, np.ndarray):
+        audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=-1)
+    return audio.astype(np.float32)
 
 def create_synthetic_wav(duration_s: float = 1.0, sample_rate: int = 16000, freq: float = 440.0) -> bytes:
     """

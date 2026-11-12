@@ -6,6 +6,7 @@ from audio_utils import (
     resample_audio,
     calculate_rms_level,
     pcm_bytes_to_float32,
+    ensure_mono_float32,
     create_synthetic_wav
 )
 
@@ -23,6 +24,37 @@ def test_resample_audio():
     # Empty array handling
     empty = resample_audio(np.empty(0, dtype=np.float32), 44100, 16000)
     assert len(empty) == 0
+
+def test_resample_audio_edge_cases():
+    # Zero or negative sample rates
+    samples = np.ones(100, dtype=np.float32)
+    assert len(resample_audio(samples, orig_sr=0, target_sr=16000)) == 0
+    assert len(resample_audio(samples, orig_sr=-44100, target_sr=16000)) == 0
+    assert len(resample_audio(samples, orig_sr=44100, target_sr=0)) == 0
+
+    # Stereo (2D) audio array input
+    stereo = np.ones((1000, 2), dtype=np.float32)
+    resampled_stereo = resample_audio(stereo, orig_sr=32000, target_sr=16000)
+    assert resampled_stereo.ndim == 1
+    assert len(resampled_stereo) == 500
+
+def test_ensure_mono_float32():
+    # 1D float32
+    mono = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+    res = ensure_mono_float32(mono)
+    assert res.ndim == 1
+    assert res.dtype == np.float32
+
+    # 2D stereo (L, R)
+    stereo = np.array([[0.2, 0.4], [0.6, 0.8]], dtype=np.float32)
+    res = ensure_mono_float32(stereo)
+    assert res.ndim == 1
+    assert np.allclose(res, [0.3, 0.7])
+
+    # int16 input converted to float32
+    ints = np.array([100, 200], dtype=np.int16)
+    res = ensure_mono_float32(ints)
+    assert res.dtype == np.float32
 
 def test_calculate_rms_level():
     # Silence

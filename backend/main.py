@@ -1,10 +1,15 @@
 import os
+import sys
 import time
 import asyncio
 import tempfile
 import threading
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
+
+# Workaround for soundcard library bug on Linux where it inspects sys.argv[1]
+if len(sys.argv) < 2:
+    sys.argv.append("sail")
 
 import numpy as np
 from fastapi import (
@@ -15,10 +20,13 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
     Query,
+    Request,
     Response,
     status
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 try:
@@ -28,7 +36,12 @@ except ImportError:
     WHISPER_AVAILABLE = False
     WhisperModel = None
 
-from audio_utils import resample_audio, calculate_rms_level, pcm_bytes_to_float32
+from audio_utils import (
+    resample_audio,
+    calculate_rms_level,
+    pcm_bytes_to_float32,
+    ensure_mono_float32
+)
 from tts import tts_manager
 
 # =====================================================
@@ -110,7 +123,6 @@ async def lifespan(app: FastAPI):
     # Startup: attempt to warm up models or initialize background components
     print("SAIL Meeting Translator backend starting up...")
     try:
-        # Pre-load or warm up in background thread if available
         threading.Thread(target=get_whisper_model, daemon=True).start()
     except Exception as e:
         print(f"Background model initialization warning: {e}")
@@ -151,6 +163,23 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+# Static files / frontend serving paths
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(BACKEND_DIR)
+DIST_DIR = os.path.join(PROJECT_DIR, "frontend", "dist")
+SAMPLES_DIR = os.path.join(BACKEND_DIR, "samples")
+
+os.makedirs(SAMPLES_DIR, exist_ok=True)
+
+# Mount samples directory
+app.mount("/samples", StaticFiles(directory=SAMPLES_DIR), name="samples")
+
+# Mount frontend assets if dist exists
+if os.path.exists(DIST_DIR):
+    assets_dir = os.path.join(DIST_DIR, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
 # =====================================================
 # REQUEST SCHEMAS
 # =====================================================
@@ -162,8 +191,7 @@ class SynthesizeRequest(BaseModel):
 # BASIC ENDPOINTS
 # =====================================================
 
-@app.get("/")
-def home():
+def get_status_dict():
     return {
         "app": "SAIL Meeting Translator",
         "status": "running",
@@ -172,6 +200,25 @@ def home():
         "show_original_text": SHOW_ORIGINAL_TEXT,
         "tts_available": tts_manager.is_model_available()
     }
+
+@app.get("/")
+def home(request: Request):
+    """
+    Serves the React frontend application to web browsers (Accept: text/html),
+    or returns JSON system status to API clients.
+    """
+    accept = request.headers.get("accept", "")
+    index_path = os.path.join(DIST_DIR, "index.html")
+
+    if "text/html" in accept and os.path.exists(index_path):
+        return FileResponse(index_path)
+
+    return get_status_dict()
+
+@app.get("/api")
+@app.get("/api/info")
+def api_info():
+    return get_status_dict()
 
 @app.get("/health")
 def health():
@@ -189,6 +236,22 @@ def get_supported_languages():
             for code, name in sorted(LANGUAGE_NAMES.items(), key=lambda x: x[1])
         ]
     }
+
+@app.get("/sample-files")
+def get_sample_files():
+    """
+    Returns available sample meeting audio files for quick testing in UI.
+    """
+    files = []
+    if os.path.exists(SAMPLES_DIR):
+        for f in sorted(os.listdir(SAMPLES_DIR)):
+            if f.endswith(".wav"):
+                files.append({
+                    "filename": f,
+                    "url": f"/samples/{f}",
+                    "name": "Sample Hindi Meeting" if "hindi" in f else "Sample English Meeting" if "english" in f else f
+                })
+    return {"samples": files}
 
 # =====================================================
 # AUDIO PROCESSING CORE
@@ -212,6 +275,10 @@ def process_audio(audio: Any) -> tuple:
     Pass 2: transcribe original language speech (if not English and SHOW_ORIGINAL_TEXT is True).
     Returns: (original_segments, translated_segments, detected_language, probability)
     """
+    # Ensure float32 mono if numpy array
+    if isinstance(audio, np.ndarray):
+        audio = ensure_mono_float32(audio)
+
     active_model = get_whisper_model()
 
     with model_lock:
@@ -250,18 +317,21 @@ def process_audio(audio: Any) -> tuple:
         if transcribe_language == "hi":
             extra["initial_prompt"] = HINDI_PROMPT
 
-        original_segments, _ = active_model.transcribe(
-            audio,
-            task="transcribe",
-            language=transcribe_language,
-            beam_size=1,
-            vad_filter=True,
-            vad_parameters=VAD_SETTINGS,
-            condition_on_previous_text=False,
-            **extra
-        )
-
-        original = collect_segments(original_segments)
+        try:
+            original_segments, _ = active_model.transcribe(
+                audio,
+                task="transcribe",
+                language=transcribe_language,
+                beam_size=1,
+                vad_filter=True,
+                vad_parameters=VAD_SETTINGS,
+                condition_on_previous_text=False,
+                **extra
+            )
+            original = collect_segments(original_segments)
+        except Exception as transcribe_err:
+            print(f"Pass 2 native script transcription error: {transcribe_err}")
+            original = []
 
     return original, translated, language, probability
 
@@ -371,6 +441,10 @@ async def browser_live_translation(
     sample_rate: int = Query(default=16000),
     talkback: bool = Query(default=False)
 ):
+    # Validate client sample rate
+    if sample_rate <= 0 or sample_rate > 192000:
+        sample_rate = 16000
+
     await websocket.accept()
     print(f"Live WebSocket connection accepted (client sample_rate: {sample_rate} Hz, talkback={talkback}).")
 
@@ -474,6 +548,9 @@ async def browser_live_translation(
             # Downsample if client sample rate differs from 16000
             if sample_rate != SAMPLE_RATE:
                 audio = resample_audio(audio, orig_sr=sample_rate, target_sr=SAMPLE_RATE)
+
+            if len(audio) == 0:
+                continue
 
             duration = len(audio) / SAMPLE_RATE
             offset = audio_offset

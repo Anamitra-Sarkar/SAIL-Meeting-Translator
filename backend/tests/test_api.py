@@ -15,6 +15,13 @@ def test_home_endpoint():
     assert "model_size" in data
     assert "sample_rate" in data
 
+def test_api_info_endpoint():
+    response = client.get("/api")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["app"] == "SAIL Meeting Translator"
+    assert data["status"] == "running"
+
 def test_health_endpoint():
     response = client.get("/health")
     assert response.status_code == 200
@@ -32,6 +39,13 @@ def test_languages_endpoint():
     assert "bn" in codes
     assert "ko" in codes
     assert "en" in codes
+
+def test_sample_files_endpoint():
+    response = client.get("/sample-files")
+    assert response.status_code == 200
+    data = response.json()
+    assert "samples" in data
+    assert isinstance(data["samples"], list)
 
 def test_language_label_helper():
     assert language_label("hi") == "Hindi"

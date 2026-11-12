@@ -2,10 +2,14 @@ import sys
 import numpy as np
 import time
 
+# Workaround for soundcard library bug on Linux where it inspects sys.argv[1]
+if len(sys.argv) < 2:
+    sys.argv.append("sail")
+
 try:
     import soundcard as sc
     SOUNDCARD_AVAILABLE = True
-except ImportError:
+except Exception:
     SOUNDCARD_AVAILABLE = False
     sc = None
 
@@ -20,8 +24,9 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 5
 
 def run_live_translate(model_size="tiny", device="cpu", compute_type="int8"):
-    if not SOUNDCARD_AVAILABLE:
-        print("Error: soundcard is not installed.", file=sys.stderr)
+    if not SOUNDCARD_AVAILABLE or sc is None:
+        print("Notice: soundcard loopback audio device is not available in this environment.", file=sys.stderr)
+        print("On headless cloud environments (Codespaces / Docker), use the web / WebSocket interface.", file=sys.stderr)
         return
 
     if not WHISPER_AVAILABLE:

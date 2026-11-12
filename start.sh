@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # Detect Python binary
 if [ -f "/workspaces/venv/bin/python" ]; then
     PYTHON_BIN="/workspaces/venv/bin/python"
@@ -17,7 +20,7 @@ echo "============================================="
 echo " Starting SAIL Meeting Translator Services"
 echo "============================================="
 
-# Ensure Piper voice exists
+# Ensure Piper voice exists & samples are prepared
 $PYTHON_BIN backend/download_voices.py || true
 
 # Start backend in background

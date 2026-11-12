@@ -1,20 +1,42 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import "./App.css";
 
-// Dynamic API URL: uses Vite env if provided, or infers from window.location
+// Dynamic API URL: handles localhost, GitHub Codespaces port subdomains, and Vite proxies
 const getApiBase = () => {
   if (import.meta.env.VITE_API_BASE_URL) {
     return import.meta.env.VITE_API_BASE_URL;
   }
-  const host = window.location.hostname || "127.0.0.1";
-  if (host === "localhost" || host === "127.0.0.1") {
+  const hostname = window.location.hostname || "127.0.0.1";
+  const protocol = window.location.protocol || "http:";
+
+  // Codespaces subdomain forwarding: e.g. *-5173.app.github.dev -> *-8000.app.github.dev
+  if (hostname.includes(".app.github.dev") && hostname.includes("-5173.")) {
+    return `${protocol}//${hostname.replace("-5173.", "-8000.")}`;
+  }
+
+  // Localhost development on Vite port 5173 -> point to FastAPI backend on 8000
+  if (hostname === "localhost" || hostname === "127.0.0.1") {
     return "http://127.0.0.1:8000";
   }
-  return `${window.location.protocol}//${host}:8000`;
+
+  // Fallback to origin
+  return window.location.origin || `${protocol}//${hostname}:8000`;
 };
 
 const API = getApiBase();
-const WS_BASE = API.replace(/^http/, "ws");
+
+const getWsBase = (apiBase) => {
+  if (apiBase.startsWith("https://")) {
+    return apiBase.replace(/^https:\/\//, "wss://");
+  }
+  if (apiBase.startsWith("http://")) {
+    return apiBase.replace(/^http:\/\//, "ws://");
+  }
+  const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${wsProto}//${window.location.host}`;
+};
+
+const WS_BASE = getWsBase(API);
 
 // Target sample rate for Whisper
 const TARGET_SAMPLE_RATE = 16000;
@@ -81,6 +103,78 @@ function App() {
   const recordingUrlRef = useRef("");
   const autoTalkbackRef = useRef(false);
 
+  // Talkback playback queue
+  const talkbackQueueRef = useRef([]);
+  const isPlayingTalkbackRef = useRef(false);
+  const processQueueRef = useRef(null);
+
+  useEffect(() => {
+    processQueueRef.current = async () => {
+      if (isPlayingTalkbackRef.current || talkbackQueueRef.current.length === 0) {
+        return;
+      }
+
+      isPlayingTalkbackRef.current = true;
+      const nextText = talkbackQueueRef.current.shift();
+
+      try {
+        let audioBlob = null;
+        try {
+          const response = await fetch(`${API}/synthesize`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: nextText })
+          });
+          if (response.ok) {
+            audioBlob = await response.blob();
+          }
+        } catch (err) {
+          console.warn("Backend TTS synthesis fetch failed:", err);
+        }
+
+        if (audioBlob) {
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          await new Promise(resolve => {
+            audio.onended = () => {
+              URL.revokeObjectURL(audioUrl);
+              resolve();
+            };
+            audio.onerror = () => {
+              URL.revokeObjectURL(audioUrl);
+              resolve();
+            };
+            audio.play().catch(resolve);
+          });
+        } else if ("speechSynthesis" in window) {
+          await new Promise(resolve => {
+            const utterance = new SpeechSynthesisUtterance(nextText);
+            utterance.lang = "en-US";
+            utterance.rate = 1.0;
+            utterance.onend = resolve;
+            utterance.onerror = resolve;
+            window.speechSynthesis.speak(utterance);
+          });
+        }
+      } catch (err) {
+        console.error("Talkback playback error:", err);
+      } finally {
+        isPlayingTalkbackRef.current = false;
+        if (processQueueRef.current) {
+          setTimeout(processQueueRef.current, 40);
+        }
+      }
+    };
+  }, []);
+
+  const playTalkback = useCallback((text) => {
+    if (!text || !text.trim()) return;
+    talkbackQueueRef.current.push(text.trim());
+    if (processQueueRef.current) {
+      processQueueRef.current();
+    }
+  }, []);
+
   // Keep ref synchronized with state
   useEffect(() => {
     recordEnabledRef.current = recordEnabled;
@@ -139,6 +233,12 @@ function App() {
   const stopTranslation = useCallback(() => {
     stoppingRef.current = true;
     setIsStarting(false);
+
+    // Empty speech talkback queue
+    talkbackQueueRef.current = [];
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
 
     const socket = socketRef.current;
     socketRef.current = null;
@@ -239,38 +339,24 @@ function App() {
     }
   }, []);
 
-  // Text-To-Speech / Talkback handler
-  const playTalkback = useCallback(async (text) => {
-    if (!text || !text.trim()) return;
-
+  // Quick loader for sample meeting audio
+  const loadSampleAudio = async (filename) => {
     try {
-      const response = await fetch(`${API}/synthesize`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: text.trim() })
-      });
-
-      if (response.ok) {
-        const audioBlob = await response.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
-        audio.onended = () => URL.revokeObjectURL(audioUrl);
-        await audio.play();
-        return;
+      setError("");
+      setStatus(`Loading sample ${filename}...`);
+      const response = await fetch(`${API}/samples/${filename}`);
+      if (!response.ok) {
+        throw new Error(`Failed to load ${filename}`);
       }
+      const blob = await response.blob();
+      const file = new File([blob], filename, { type: "audio/wav" });
+      setAudioFile(file);
+      setStatus(`Sample ${filename} loaded. Click "Translate File" to process.`);
     } catch (err) {
-      console.warn("Backend TTS synthesis unavailable, using Web Speech API fallback:", err);
+      setError(`Could not load sample: ${err.message}`);
+      setStatus("Ready");
     }
-
-    // Fallback: Web Speech API
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = "en-US";
-      utterance.rate = 1.0;
-      window.speechSynthesis.speak(utterance);
-    }
-  }, []);
+  };
 
   const startFileTranslation = async () => {
     if (!audioFile) {
@@ -362,6 +448,19 @@ function App() {
             : "No microphone audio track found."
         );
       }
+
+      // Attach ended listeners to clean up automatically if user stops screen sharing or disconnects mic
+      stream.getTracks().forEach(track => {
+        track.addEventListener(
+          "ended",
+          () => {
+            if (socketRef.current === socket) {
+              stopTranslation();
+            }
+          },
+          { once: true }
+        );
+      });
 
       if (recordEnabledRef.current) {
         startRecording(stream);
@@ -504,17 +603,6 @@ function App() {
         }
       };
 
-      if (audioSource === "screen") {
-        stream.getVideoTracks()[0]?.addEventListener(
-          "ended",
-          () => {
-            if (socketRef.current === socket) {
-              stopTranslation();
-            }
-          },
-          { once: true }
-        );
-      }
     } catch (err) {
       console.error("Live translation error:", err);
       cleanupAudio();
@@ -578,6 +666,10 @@ function App() {
   };
 
   const clearTranscript = () => {
+    talkbackQueueRef.current = [];
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
     setTranslation([]);
     setOriginalTranscript([]);
     setDetectedLanguage("");
@@ -702,6 +794,27 @@ function App() {
             </button>
           </div>
 
+          {/* Quick sample audio testing buttons */}
+          <div className="sample-quickload-row">
+            <span className="quickload-label">Quick Test Samples:</span>
+            <button
+              className="sample-btn"
+              type="button"
+              disabled={isLive || isStarting || loading}
+              onClick={() => loadSampleAudio("sample_hindi.wav")}
+            >
+              🇮🇳 Load Hindi Meeting Sample
+            </button>
+            <button
+              className="sample-btn"
+              type="button"
+              disabled={isLive || isStarting || loading}
+              onClick={() => loadSampleAudio("sample_english.wav")}
+            >
+              🇬🇧 Load English Meeting Sample
+            </button>
+          </div>
+
           <div className="options-row">
             <label className="checkbox-option">
               <input
@@ -709,7 +822,7 @@ function App() {
                 checked={autoTalkback}
                 onChange={e => setAutoTalkback(e.target.checked)}
               />
-              🔊 <strong>Auto-Talkback</strong> (Read English translations aloud automatically)
+              🔊 <strong>Auto-Talkback</strong> (Read English translations aloud sequentially)
             </label>
 
             <label className="checkbox-option">
@@ -896,7 +1009,7 @@ function App() {
           <div className="feature card">
             <span className="feature-icon">03</span>
             <h3>Neural Talkback Synthesizer</h3>
-            <p>Natural English voice synthesis powered by Piper TTS for real-time auditory translation.</p>
+            <p>Natural English voice synthesis powered by Piper TTS with non-overlapping sequential playback.</p>
           </div>
         </section>
 
