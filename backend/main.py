@@ -295,7 +295,9 @@ def process_audio(audio: Any) -> tuple:
             vad_filter=True,
             vad_parameters=VAD_SETTINGS,
             initial_prompt=MEETING_PROMPT,
-            condition_on_previous_text=False
+            condition_on_previous_text=False,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3
         )
 
         translated = collect_segments(translated_segments)
@@ -332,6 +334,8 @@ def process_audio(audio: Any) -> tuple:
                 vad_filter=True,
                 vad_parameters=VAD_SETTINGS,
                 condition_on_previous_text=False,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
                 **extra
             )
             original = collect_segments(original_segments)
