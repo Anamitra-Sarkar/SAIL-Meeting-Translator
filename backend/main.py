@@ -65,6 +65,11 @@ HINDI_PROMPT = (
     "उर्दू लिपि का उपयोग न करें।"
 )
 
+MEETING_PROMPT = os.getenv(
+    "MEETING_PROMPT",
+    "This is an official business meeting at Steel Authority of India Limited (SAIL) discussing steel production, plant operations, safety compliance, and financial targets."
+)
+
 VAD_SETTINGS = {"min_silence_duration_ms": 500}
 
 LANGUAGE_NAMES: Dict[str, str] = {
@@ -286,9 +291,10 @@ def process_audio(audio: Any) -> tuple:
         translated_segments, info = active_model.transcribe(
             audio,
             task="translate",
-            beam_size=1,
+            beam_size=2,
             vad_filter=True,
             vad_parameters=VAD_SETTINGS,
+            initial_prompt=MEETING_PROMPT,
             condition_on_previous_text=False
         )
 

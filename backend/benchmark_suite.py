@@ -135,13 +135,17 @@ def run_benchmarks():
         if sr != 16000:
             audio = resample_audio(audio, orig_sr=sr, target_sr=16000)
 
-        # Transcribe & Translate
+        # Transcribe & Translate matching main.py settings
+        MEETING_PROMPT = "This is an official business meeting at Steel Authority of India Limited (SAIL) discussing steel production, plant operations, safety compliance, and financial targets."
         t0 = time.perf_counter()
         segments_gen, info = whisper_model.transcribe(
             audio,
             task="translate",
-            beam_size=1,
-            vad_filter=True
+            beam_size=2,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
+            initial_prompt=MEETING_PROMPT,
+            condition_on_previous_text=False
         )
         translated_segments = list(segments_gen)
         transcribe_time_ms = (time.perf_counter() - t0) * 1000
@@ -150,8 +154,10 @@ def run_benchmarks():
         rtf = (transcribe_time_ms / 1000.0) / audio_dur_s
         speedup = 1.0 / rtf if rtf > 0 else 0
 
-        # Verification metrics
+        # Verification metrics (TREAT_URDU_AS_HINDI applies like in main.py)
         lang_detected = info.language
+        if lang_detected == "ur":
+            lang_detected = "hi"
         confidence = info.language_probability
         matched_keywords = [kw for kw in tc["expected_keywords"] if kw.lower() in translated_text.lower()]
         keyword_coverage = len(matched_keywords) / len(tc["expected_keywords"])

@@ -1,4 +1,5 @@
 import io
+import math
 import wave
 import numpy as np
 from scipy import signal
@@ -20,12 +21,11 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int = TARGET_SAMP
     if audio.ndim > 1:
         audio = audio.mean(axis=-1)
 
-    # Calculate target number of samples
-    target_length = int(round(len(audio) * float(target_sr) / float(orig_sr)))
-    if target_length <= 0:
-        return np.empty(0, dtype=np.float32)
-
-    resampled = signal.resample(audio, target_length)
+    # Polyphase resampling (FIR filter) avoids Gibbs ringing/spectral smearing
+    g = math.gcd(int(orig_sr), int(target_sr))
+    up = int(target_sr) // g
+    down = int(orig_sr) // g
+    resampled = signal.resample_poly(audio, up, down)
     return resampled.astype(np.float32)
 
 def calculate_rms_level(audio: np.ndarray) -> float:
