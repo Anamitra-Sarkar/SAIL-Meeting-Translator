@@ -3,6 +3,8 @@ import time
 import asyncio
 import tempfile
 import threading
+from contextlib import asynccontextmanager
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 from fastapi import (
@@ -11,47 +13,38 @@ from fastapi import (
     File,
     HTTPException,
     WebSocket,
-    WebSocketDisconnect
+    WebSocketDisconnect,
+    Query,
+    Response,
+    status
 )
 from fastapi.middleware.cors import CORSMiddleware
-from faster_whisper import WhisperModel
+from pydantic import BaseModel
 
+try:
+    from faster_whisper import WhisperModel
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    WhisperModel = None
+
+from audio_utils import resample_audio, calculate_rms_level, pcm_bytes_to_float32
+from tts import tts_manager
 
 # =====================================================
-# SETTINGS (safe to change)
+# SETTINGS & CONFIGURATION
 # =====================================================
 
-# "base" is fast. "small" is more accurate but slower.
-MODEL_SIZE = "base"
-
-# CPU threads used by Whisper
-CPU_THREADS = max(2, (os.cpu_count() or 4) - 1)
-
-# Browser sends audio at 16000 Hz
-SAMPLE_RATE = 16000
-
-# Chunks quieter than this are treated as silence and skipped
-SILENCE_LEVEL = 0.003
-
-# Audio is NEVER skipped while the model is busy: chunks wait in line.
-# 120 chunks of 10 seconds = 20 minutes of waiting audio (about 75 MB).
-# Only if the line gets longer than this is the oldest chunk dropped,
-# to protect the computer's memory.
-MAX_WAITING_CHUNKS = 120
-
-# False = FAST mode: one Whisper pass per chunk (English text only).
-# True  = also write the original-language text (needs a second pass,
-#         so it takes roughly twice as long).
-# Start with False. Change to True only if the terminal shows that
-# "Processed ... in ..." is clearly shorter than the audio length.
-SHOW_ORIGINAL_TEXT = True
-
-# True  = if Whisper hears Urdu, show it as Hindi (Devanagari)
-# False = keep Urdu as Urdu
-TREAT_URDU_AS_HINDI = True
-
-# True = do not show anything when English is detected
-IGNORE_ENGLISH = False
+MODEL_SIZE = os.getenv("MODEL_SIZE", "base")
+CPU_THREADS = int(os.getenv("CPU_THREADS", max(2, (os.cpu_count() or 4) - 1)))
+SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
+SILENCE_LEVEL = float(os.getenv("SILENCE_LEVEL", "0.003"))
+MAX_WAITING_CHUNKS = int(os.getenv("MAX_WAITING_CHUNKS", "120"))
+SHOW_ORIGINAL_TEXT = os.getenv("SHOW_ORIGINAL_TEXT", "True").lower() in ("true", "1", "yes")
+TREAT_URDU_AS_HINDI = os.getenv("TREAT_URDU_AS_HINDI", "True").lower() in ("true", "1", "yes")
+IGNORE_ENGLISH = os.getenv("IGNORE_ENGLISH", "False").lower() in ("true", "1", "yes")
+DEVICE = os.getenv("DEVICE", "cpu")
+COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
 
 HINDI_PROMPT = (
     "यह हिंदी भाषा में बोला गया है। "
@@ -61,42 +54,7 @@ HINDI_PROMPT = (
 
 VAD_SETTINGS = {"min_silence_duration_ms": 500}
 
-
-# =====================================================
-# APP SETUP
-# =====================================================
-
-app = FastAPI(title="SAIL Meeting Translator")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-print("Loading Whisper model...")
-
-model = WhisperModel(
-    MODEL_SIZE,
-    device="cpu",
-    compute_type="int8",
-    cpu_threads=CPU_THREADS
-)
-
-# Only one transcription may use the model at a time
-model_lock = threading.Lock()
-
-print("Whisper model loaded successfully.")
-
-
-LANGUAGE_NAMES = {
+LANGUAGE_NAMES: Dict[str, str] = {
     "hi": "Hindi",
     "bn": "Bengali",
     "ko": "Korean",
@@ -114,13 +72,91 @@ LANGUAGE_NAMES = {
     "es": "Spanish",
     "ar": "Arabic",
     "ru": "Russian",
-    "pt": "Portuguese"
+    "pt": "Portuguese",
+    "it": "Italian",
+    "nl": "Dutch",
+    "tr": "Turkish",
+    "vi": "Vietnamese"
 }
 
+def language_label(code: Optional[str]) -> str:
+    if not code:
+        return "Unknown"
+    return LANGUAGE_NAMES.get(code.lower(), code.upper())
 
-def language_label(code):
-    return LANGUAGE_NAMES.get(code, code.upper())
+# Model singleton and lock
+model: Optional[Any] = None
+model_lock = threading.Lock()
 
+def get_whisper_model():
+    global model
+    if model is None:
+        with model_lock:
+            if model is None:
+                if not WHISPER_AVAILABLE:
+                    raise RuntimeError("faster-whisper is not installed.")
+                print(f"Loading Whisper model ('{MODEL_SIZE}', device={DEVICE}, compute_type={COMPUTE_TYPE})...")
+                model = WhisperModel(
+                    MODEL_SIZE,
+                    device=DEVICE,
+                    compute_type=COMPUTE_TYPE,
+                    cpu_threads=CPU_THREADS
+                )
+                print("Whisper model loaded successfully.")
+    return model
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: attempt to warm up models or initialize background components
+    print("SAIL Meeting Translator backend starting up...")
+    try:
+        # Pre-load or warm up in background thread if available
+        threading.Thread(target=get_whisper_model, daemon=True).start()
+    except Exception as e:
+        print(f"Background model initialization warning: {e}")
+    try:
+        threading.Thread(target=tts_manager.load_voice, daemon=True).start()
+    except Exception as e:
+        print(f"Background TTS initialization warning: {e}")
+    yield
+    print("SAIL Meeting Translator backend shutting down...")
+
+# =====================================================
+# APP SETUP
+# =====================================================
+
+app = FastAPI(
+    title="SAIL Meeting Translator",
+    description="Multilingual meeting translation & talkback system for SAIL internal infrastructure",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Flexible CORS to allow localhost, Codespaces (*.app.github.dev), and configurable origins
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+]
+custom_origins = os.getenv("CORS_ORIGINS", "")
+if custom_origins:
+    ALLOWED_ORIGINS.extend([o.strip() for o in custom_origins.split(",") if o.strip()])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if os.getenv("CORS_ALLOW_ALL", "true").lower() in ("true", "1") else ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# =====================================================
+# REQUEST SCHEMAS
+# =====================================================
+
+class SynthesizeRequest(BaseModel):
+    text: str
 
 # =====================================================
 # BASIC ENDPOINTS
@@ -128,45 +164,59 @@ def language_label(code):
 
 @app.get("/")
 def home():
-    return {"message": "SAIL Meeting Translator backend is running!"}
-
+    return {
+        "app": "SAIL Meeting Translator",
+        "status": "running",
+        "model_size": MODEL_SIZE,
+        "sample_rate": SAMPLE_RATE,
+        "show_original_text": SHOW_ORIGINAL_TEXT,
+        "tts_available": tts_manager.is_model_available()
+    }
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "whisper_ready": model is not None or WHISPER_AVAILABLE,
+        "tts_ready": tts_manager.is_model_available()
+    }
 
+@app.get("/languages")
+def get_supported_languages():
+    return {
+        "languages": [
+            {"code": code, "name": name}
+            for code, name in sorted(LANGUAGE_NAMES.items(), key=lambda x: x[1])
+        ]
+    }
 
 # =====================================================
-# AUDIO PROCESSING
+# AUDIO PROCESSING CORE
 # =====================================================
 
-def collect_segments(segments):
+def collect_segments(segments) -> List[Dict[str, Any]]:
     result = []
-
     for segment in segments:
         text = segment.text.strip()
-
         if text:
             result.append({
-                "start": round(segment.start, 2),
-                "end": round(segment.end, 2),
+                "start": round(float(segment.start), 2),
+                "end": round(float(segment.end), 2),
                 "text": text
             })
-
     return result
 
-
-def process_audio(audio):
+def process_audio(audio: Any) -> tuple:
     """
-    Pass 1: translate to English and detect the language.
-    Pass 2: write the original speech (only if not English).
-    Returns: original, translated, language, probability
+    Pass 1: translate speech to English and detect language.
+    Pass 2: transcribe original language speech (if not English and SHOW_ORIGINAL_TEXT is True).
+    Returns: (original_segments, translated_segments, detected_language, probability)
     """
+    active_model = get_whisper_model()
 
     with model_lock:
-
-        # ---- Pass 1: English translation + language detection ----
-        translated_segments, info = model.transcribe(
+        # Pass 1: English translation + language detection
+        translated_segments, info = active_model.transcribe(
             audio,
             task="translate",
             beam_size=1,
@@ -176,15 +226,13 @@ def process_audio(audio):
         )
 
         translated = collect_segments(translated_segments)
-
         language = info.language
-        probability = info.language_probability
+        probability = float(info.language_probability)
 
-        # No speech found in this chunk
         if not translated:
             return [], [], language, probability
 
-        # English speech: original and translation are the same
+        # If detected language is already English, original & translation are identical
         if language == "en":
             return translated, translated, language, probability
 
@@ -195,16 +243,14 @@ def process_audio(audio):
             transcribe_language = "hi"
             language = "hi"
 
-        # FAST mode: stop here, no second pass
         if not SHOW_ORIGINAL_TEXT:
             return [], translated, language, probability
 
-        # ---- Pass 2: original text in the original language ----
-
+        # Pass 2: original text transcription in native script
         if transcribe_language == "hi":
             extra["initial_prompt"] = HINDI_PROMPT
 
-        original_segments, _ = model.transcribe(
+        original_segments, _ = active_model.transcribe(
             audio,
             task="transcribe",
             language=transcribe_language,
@@ -219,33 +265,46 @@ def process_audio(audio):
 
     return original, translated, language, probability
 
-
 # =====================================================
 # UPLOADED FILE TRANSLATION
 # =====================================================
 
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".wav", ".mp3", ".ogg", ".webm", ".m4a", ".flac", ".aac", ".opus"
+}
+
 @app.post("/translate-audio")
 async def translate_audio(file: UploadFile = File(...)):
-
     if not file.filename:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="No audio file selected."
         )
 
-    suffix = os.path.splitext(file.filename)[1] or ".wav"
+    suffix = os.path.splitext(file.filename)[1].lower()
+    if suffix and suffix not in SUPPORTED_AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported audio format '{suffix}'. Allowed: {', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}"
+        )
+
+    suffix = suffix or ".wav"
     temp_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix
-        ) as temp_file:
-            temp_path = temp_file.name
-            temp_file.write(await file.read())
+        content = await file.read()
+        if len(content) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty."
+            )
 
-        original, translated, language, probability = (
-            await asyncio.to_thread(process_audio, temp_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(content)
+
+        original, translated, language, probability = await asyncio.to_thread(
+            process_audio, temp_path
         )
 
         return {
@@ -256,51 +315,82 @@ async def translate_audio(file: UploadFile = File(...)):
             "translation": translated
         }
 
+    except HTTPException:
+        raise
     except Exception as error:
-        print("File translation error:", error)
-        raise HTTPException(status_code=500, detail=str(error))
-
+        print(f"File translation error: {error}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Audio translation failed: {str(error)}"
+        )
     finally:
         if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 # =====================================================
-# LIVE BROWSER AUDIO
+# TEXT-TO-SPEECH (TALKBACK) ENDPOINT
+# =====================================================
+
+@app.post("/synthesize")
+async def synthesize_speech(req: SynthesizeRequest):
+    """
+    Generate spoken English WAV audio for translated text using Piper TTS.
+    """
+    if not req.text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Text cannot be empty."
+        )
+
+    try:
+        wav_bytes = await asyncio.to_thread(tts_manager.synthesize_wav, req.text)
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": 'inline; filename="talkback.wav"'
+            }
+        )
+    except Exception as e:
+        print(f"TTS synthesis error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Talkback synthesis failed: {str(e)}"
+        )
+
+# =====================================================
+# LIVE BROWSER AUDIO WEBSOCKET
 # =====================================================
 
 @app.websocket("/ws/browser-live")
-async def browser_live_translation(websocket: WebSocket):
-
+async def browser_live_translation(
+    websocket: WebSocket,
+    sample_rate: int = Query(default=16000),
+    talkback: bool = Query(default=False)
+):
     await websocket.accept()
-    print("Live connection opened.")
+    print(f"Live WebSocket connection accepted (client sample_rate: {sample_rate} Hz, talkback={talkback}).")
 
-    # Audio chunks wait here while the model is busy
-    queue = asyncio.Queue(maxsize=MAX_WAITING_CHUNKS)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_WAITING_CHUNKS)
 
     async def worker():
-        # Takes chunks from the queue, one at a time.
-        # An error in one chunk never closes the connection.
         try:
             while True:
                 audio, offset = await queue.get()
 
                 try:
                     started = time.perf_counter()
-
-                    original, translated, language, probability = (
-                        await asyncio.to_thread(process_audio, audio)
+                    original, translated, language, probability = await asyncio.to_thread(
+                        process_audio, audio
                     )
-
-                    print(
-                        "Processed",
-                        round(len(audio) / SAMPLE_RATE, 1),
-                        "s of audio in",
-                        round(time.perf_counter() - started, 1),
-                        "s"
-                    )
+                    duration_s = round(len(audio) / SAMPLE_RATE, 2)
+                    elapsed_s = round(time.perf_counter() - started, 2)
+                    print(f"Processed {duration_s}s audio in {elapsed_s}s.")
                 except Exception as error:
-                    print("Chunk processing error:", error)
+                    print(f"Chunk processing error: {error}")
                     await websocket.send_json({
                         "type": "error",
                         "message": f"Processing error: {error}"
@@ -314,13 +404,6 @@ async def browser_live_translation(websocket: WebSocket):
                     continue
 
                 name = language_label(language)
-
-                print(
-                    "Detected:", name,
-                    "| Confidence:", round(probability, 2),
-                    "| Original segments:", len(original),
-                    "| English segments:", len(translated)
-                )
 
                 for segment in original:
                     await websocket.send_json({
@@ -344,21 +427,20 @@ async def browser_live_translation(websocket: WebSocket):
                     })
 
                 waiting = queue.qsize()
-
+                status_msg = (
+                    "Listening to meeting audio..."
+                    if waiting == 0
+                    else f"Catching up: {waiting} audio chunk(s) queued."
+                )
                 await websocket.send_json({
                     "type": "status",
-                    "message": (
-                        "Listening to system audio..."
-                        if waiting == 0
-                        else f"Catching up: {waiting} audio chunk(s) "
-                             "waiting. Nothing is skipped."
-                    )
+                    "message": status_msg
                 })
 
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            print("Worker stopped:", error)
+            print(f"WebSocket worker stopped: {error}")
 
     worker_task = asyncio.create_task(worker())
     audio_offset = 0.0
@@ -366,57 +448,50 @@ async def browser_live_translation(websocket: WebSocket):
     try:
         await websocket.send_json({
             "type": "status",
-            "message": "Browser audio connection established."
+            "message": "Live audio translation connection established."
         })
 
         while True:
             message = await websocket.receive()
 
             if message["type"] == "websocket.disconnect":
-                print("Browser closed the connection.")
                 break
 
-            audio_bytes = message.get("bytes")
-
-            # Float32 audio needs complete 4-byte samples
-            if not audio_bytes or len(audio_bytes) % 4 != 0:
+            # Handle text messages (e.g. heartbeat ping or config change)
+            if "text" in message and message["text"]:
+                if message["text"] == "ping":
+                    await websocket.send_text("pong")
                 continue
 
-            audio = np.frombuffer(
-                audio_bytes,
-                dtype=np.float32
-            ).copy()
+            audio_bytes = message.get("bytes")
+            if not audio_bytes:
+                continue
 
+            audio = pcm_bytes_to_float32(audio_bytes)
             if len(audio) == 0:
                 continue
+
+            # Downsample if client sample rate differs from 16000
+            if sample_rate != SAMPLE_RATE:
+                audio = resample_audio(audio, orig_sr=sample_rate, target_sr=SAMPLE_RATE)
 
             duration = len(audio) / SAMPLE_RATE
             offset = audio_offset
             audio_offset += duration
 
-            level = float(np.sqrt(np.mean(audio ** 2)))
+            level = calculate_rms_level(audio)
 
-            print(
-                "Audio received:",
-                round(duration, 2), "seconds",
-                "| Level:", round(level, 4)
-            )
-
-            # Skip silence to save processing time
+            # Skip silent chunks
             if level < SILENCE_LEVEL:
                 continue
 
-            # Only if the line is extremely long (memory protection)
+            # Queue full handling: drop oldest chunk if line exceeds capacity
             if queue.full():
                 try:
                     queue.get_nowait()
-                    print("Line too long: dropped one old audio chunk.")
                     await websocket.send_json({
                         "type": "status",
-                        "message": (
-                            "Translation is far behind. "
-                            "The oldest audio was skipped."
-                        )
+                        "message": "Translation line full. Oldest chunk skipped."
                     })
                 except asyncio.QueueEmpty:
                     pass
@@ -426,18 +501,17 @@ async def browser_live_translation(websocket: WebSocket):
             if queue.qsize() >= 2:
                 await websocket.send_json({
                     "type": "status",
-                    "message": (
-                        f"Catching up: {queue.qsize()} audio chunk(s) "
-                        "waiting. Nothing is skipped."
-                    )
+                    "message": f"Catching up: {queue.qsize()} chunks waiting."
                 })
 
     except WebSocketDisconnect:
-        print("Browser audio connection disconnected.")
-
+        print("WebSocket client disconnected.")
     except Exception as error:
-        print("Live connection error:", error)
-
+        print(f"WebSocket connection error: {error}")
     finally:
         worker_task.cancel()
-        print("Live connection closed.")
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+        print("Live connection cleaned up.")
