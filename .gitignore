@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# AI models
+*.onnx
+*.bin
+*.pt
+*.safetensors
+models/
+voices/
+
+# Node
+node_modules/
+dist/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Temporary files
+*.log
+*.wav
+*.mp3
+*.mp4
+
+# IDE
+.vscode/

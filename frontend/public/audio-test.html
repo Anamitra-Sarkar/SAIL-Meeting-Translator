@@ -1,0 +1,53 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SAIL Audio Capture Test</title>
+</head>
+<body>
+  <h2>SAIL Meeting Translator - Audio Test</h2>
+  <p>Test whether your browser can capture shared system audio.</p>
+
+  <button id="start">Start Audio Capture</button>
+  <button id="stop" disabled>Stop Capture</button>
+
+  <p id="status">Status: Ready</p>
+
+  <script>
+    let stream;
+
+    document.getElementById("start").onclick = async () => {
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: {
+            systemAudio: "include"
+          }
+        });
+
+        const audioTracks = stream.getAudioTracks();
+
+        document.getElementById("status").textContent =
+          audioTracks.length > 0
+            ? "SUCCESS: System audio captured!"
+            : "No audio track received. Check sharing options.";
+
+        document.getElementById("stop").disabled = false;
+      } catch (error) {
+        document.getElementById("status").textContent =
+          "Error: " + error.message;
+      }
+    };
+
+    document.getElementById("stop").onclick = () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+
+      document.getElementById("status").textContent = "Status: Stopped";
+      document.getElementById("stop").disabled = true;
+    };
+  </script>
+</body>
+</html>
