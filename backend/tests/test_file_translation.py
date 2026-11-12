@@ -4,7 +4,7 @@ import wave
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
-from main import app
+from main import app, WHISPER_AVAILABLE
 from audio_utils import create_synthetic_wav
 from tts import tts_manager
 
@@ -26,6 +26,7 @@ def test_translate_audio_invalid_extension():
     assert response.status_code == 400
     assert "unsupported" in response.json()["detail"].lower()
 
+@pytest.mark.skipif(not WHISPER_AVAILABLE, reason="faster-whisper is not installed")
 def test_translate_audio_valid_wav():
     wav_content = create_synthetic_wav(duration_s=1.0, sample_rate=16000)
     response = client.post(
